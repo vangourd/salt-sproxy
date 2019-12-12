@@ -41,6 +41,7 @@ from salt.minion import SMinion
 from salt.ext.six.moves import range
 import salt.defaults.exitcodes
 from salt.exceptions import SaltSystemExit
+from salt.defaults import DEFAULT_TARGET_DELIM
 
 import salt.utils.napalm
 
@@ -133,6 +134,23 @@ class SProxyMinion(SMinion):
     functions for general use.
     '''
 
+    def _matches_target(self):
+        match_func = self.matchers.get(
+            '{0}_match.match'.format(self.opts['__tgt_type']), None
+        )
+        if match_func is None:
+            return False
+        if self.opts['__tgt_type'] in ('grain', 'grain_pcre', 'pillar'):
+            delimiter = self.opts.get('delimiter', DEFAULT_TARGET_DELIM)
+            if not match_func(self.opts['__tgt'], delimiter=delimiter):
+                return False
+        elif not match_func(self.opts['__tgt']):
+            return False
+        else:
+            if not self.matchers['glob_match.match'](self.opts['__tgt']):
+                return False
+        return True
+
     def gen_modules(self, initial_load=False):
         '''
         Tell the minion to reload the execution modules.
@@ -147,6 +165,12 @@ class SProxyMinion(SMinion):
         if self.opts.get('proxy_use_cached_grains', True):
             cached_grains = self.opts.pop('proxy_cached_grains', None)
 
+        if not cached_grains and self.opts.get('proxy_preload_grains', True):
+            loaded_grains = salt.loader.grains(self.opts)
+            self.opts['grains'].update(loaded_grains)
+        elif cached_grains:
+            self.opts['grains'].update(cached_grains)
+
         if (
             self.opts['roster_opts']
             and self.opts.get('proxy_merge_roster_grains', True)
@@ -156,12 +180,6 @@ class SProxyMinion(SMinion):
             # Merge the Grains from the Roster opts
             log.debug('Merging Grains with the Roster provided ones')
             self.opts['grains'].update(self.opts['roster_opts']['grains'])
-
-        if not cached_grains and self.opts.get('proxy_preload_grains', True):
-            loaded_grains = salt.loader.grains(self.opts)
-            self.opts['grains'].update(loaded_grains)
-        elif cached_grains:
-            self.opts['grains'].update(cached_grains)
 
         cached_pillar = None
         if self.opts.get('proxy_use_cached_pillar', True):
@@ -182,10 +200,20 @@ class SProxyMinion(SMinion):
                 self.opts['pillar']['proxy'] = {}
             self.opts['pillar']['proxy'].update(self.opts['roster_opts'])
 
+        if self.opts.get('preload_targeting', False) or self.opts.get(
+            'invasive_targeting', False
+        ):
+            log.debug('Loading the Matchers modules')
+            self.matchers = salt.loader.matchers(self.opts)
+
         if self.opts.get('preload_targeting', False):
-            # TODO: check if the Minion matches the target expression
-            # Otherwise:
-            matched = False
+            log.debug(
+                'Preload targeting requested, trying to see if %s matches the target %s (%s)',
+                self.opts['id'],
+                str(self.opts['__tgt']),
+                self.opts['__tgt_type'],
+            )
+            matched = self._matches_target()
             if not matched:
                 return
 
@@ -258,17 +286,21 @@ class SProxyMinion(SMinion):
                 loaded_grains = salt.loader.grains(self.opts, proxy=self.proxy)
                 self.opts['grains'].update(loaded_grains)
             self.functions.pack['__grains__'] = self.opts['grains']
-
         self.grains_cache = copy.deepcopy(self.opts['grains'])
 
         if self.opts.get('invasive_targeting', False):
-            log.info('Invasive targeting requested, trying to see if %s matches the target', self.opts['id'])
-            # TODO: check if the Minion matches the target expression
-            # Otherwise:
-            matched = False
+            log.info(
+                'Invasive targeting requested, trying to see if %s matches the target %s (%s)',
+                self.opts['id'],
+                str(self.opts['__tgt']),
+                self.opts['__tgt_type'],
+            )
+            matched = self._matches_target()
             if not matched:
                 # Didn't match, shutting down this Proxy Minion, and exiting.
-                log.debug('%s does not match the target expression, aborting', self.opts['id'])
+                log.debug(
+                    '%s does not match the target expression, aborting', self.opts['id']
+                )
                 proxy_shut_fn = self.proxy[fq_proxyname + '.shutdown']
                 proxy_shut_fn(self.opts)
                 return
@@ -306,6 +338,8 @@ def salt_call(
     jid=None,
     roster_opts=None,
     test_ping=False,
+    tgt=None,
+    tgt_type=None,
     preload_targeting=False,
     invasive_targeting=False,
     args=(),
@@ -440,6 +474,8 @@ def salt_call(
     opts['id'] = minion_id
     opts['pillarenv'] = __opts__.get('pillarenv', 'base')
     opts['__cli'] = __opts__.get('__cli', 'salt-call')
+    opts['__tgt'] = tgt
+    opts['__tgt_type'] = tgt_type
     if 'saltenv' not in opts:
         opts['saltenv'] = 'base'
     if not default_grains:
@@ -474,7 +510,9 @@ def salt_call(
             opts[opt] = val
     sa_proxy = StandaloneProxy(opts)
     if not sa_proxy.ready:
-        log.debug('The SProxy Minion for %s is not able to start up, aborting', opts['id'])
+        log.debug(
+            'The SProxy Minion for %s is not able to start up, aborting', opts['id']
+        )
         return
     kwargs = clean_kwargs(**kwargs)
     ret = None
@@ -649,6 +687,8 @@ def execute_devices(
         'use_existing_proxy': use_existing_proxy,
         'no_connect': no_connect,
         'test_ping': test_ping,
+        'tgt': tgt,
+        'tgt_type': tgt_type,
     }
     opts.update(kwargs)
     if events:

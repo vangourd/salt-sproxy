@@ -259,4 +259,3 @@ class SaltStandaloneProxy(SaltStandaloneProxyOptionParser):
 
         except SaltClientError as exc:
             raise SystemExit(six.text_type(exc))
-
